@@ -646,13 +646,13 @@ def get_bundles():
         conn = get_db_connection()
         cursor = conn.cursor(dictionary=True)
 
-        # 1️⃣ Get bundle stock, selling price, buying price, product count
+        # 1️⃣ Get bundle stock, selling price, buying price (from stored value), product count
         cursor.execute("""
             SELECT 
                 pb.bundle_id,
                 MIN(FLOOR(p.product_stock / pb.quantity)) AS bundle_stock,
                 MAX(pb.selling_price) AS selling_price,
-                SUM(p.buying_price * pb.quantity) AS buying_price,
+                MAX(pb.bundle_buying_price) AS buying_price,  -- Use stored value
                 SUM(pb.quantity) AS products_count
             FROM product_bundles pb
             JOIN products p ON p.product_id = pb.child_product_id
@@ -665,11 +665,12 @@ def get_bundles():
         for bundle in bundles:
             bundle_id = bundle["bundle_id"]
 
-            # 2️⃣ Get bundle items
+            # 2️⃣ Get bundle items - CHANGE HERE: use product_price instead of buying_price
             cursor.execute("""
                 SELECT 
                     p.product_id,
                     p.product_name,
+                    p.product_price,  -- Changed from buying_price to product_price
                     pb.quantity
                 FROM product_bundles pb
                 JOIN products p ON p.product_id = pb.child_product_id
@@ -677,24 +678,31 @@ def get_bundles():
             """, (bundle_id,))
             items = cursor.fetchall()
 
-            bundle_name = "Bundle of " + " + ".join(
-                item["product_name"] for item in items
-            )
+            # Create a more descriptive bundle name with quantities
+            if items:
+                bundle_name = "Bundle of " + " + ".join(
+                    f"{item['quantity']}×{item['product_name']}" for item in items
+                )
+            else:
+                bundle_name = f"Bundle #{bundle_id}"
 
             result.append({
                 "bundle_id": bundle_id,
                 "product_name": bundle_name,
                 "product_price": bundle["selling_price"],
-                "buying_price": bundle["buying_price"],   # ✅ calculated
-                "product_stock": bundle["bundle_stock"],
-                "products_count": bundle["products_count"],  # ✅ count
+                "buying_price": float(bundle["buying_price"] or 0),   # This is the stored bundle cost
+                "product_stock": bundle["bundle_stock"] or 0,
+                "products_count": bundle["products_count"] or 0,
                 "is_bundle": True,
-                "items": items
+                "items": items  # Items now contain product_price instead of buying_price
             })
 
         return jsonify(result), 200
 
     except Exception as e:
+        print(f"❌ Error in get_bundles: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
     finally:
@@ -791,6 +799,7 @@ def add_bundle():
     cursor = None
     try:
         data = request.json
+        print("📦 Received bundle data:", data)
 
         bundle_items = data.get("bundle_items", [])
         selling_price = data.get("selling_price")
@@ -822,8 +831,40 @@ def add_bundle():
 
         # Generate new bundle_id
         cursor.execute("SELECT IFNULL(MAX(bundle_id), 0) + 1 AS next_id FROM product_bundles")
-        bundle_id = cursor.fetchone()["next_id"]
+        result = cursor.fetchone()
+        bundle_id = result["next_id"] if result else 1
+        print(f"🆕 Generated bundle_id: {bundle_id}")
 
+        # Calculate total buying price for the bundle using product_price
+        total_buying_price = 0
+        print("💰 Calculating buying prices from buying_price:")
+        
+        for item in bundle_items:
+            product_id = item["product_id"]
+            quantity = item.get("quantity", 1)
+            print(f"  Product ID: {product_id}, Quantity: {quantity}")
+            
+            # Use product_price instead of buying_price
+            cursor.execute(
+                "SELECT buying_price FROM products WHERE product_id = %s",
+                (product_id,)
+            )
+            product = cursor.fetchone()
+            
+            if product:
+                product_cost = product["buying_price"] or 0
+                print(f"    Product price (cost): {product_cost}")
+                
+                item_cost = product_cost * quantity
+                print(f"    Item cost: {item_cost}")
+                
+                total_buying_price += item_cost
+            else:
+                print(f"    ❌ Product {product_id} not found!")
+
+        print(f"💰 TOTAL BUNDLE COST: {total_buying_price}")
+
+        # Insert bundle items with the calculated cost
         for item in bundle_items:
             cursor.execute("""
                 INSERT INTO product_bundles (
@@ -831,26 +872,33 @@ def add_bundle():
                     parent_product_id,
                     child_product_id,
                     quantity,
-                    selling_price
+                    selling_price,
+                    bundle_buying_price
                 )
-                VALUES (%s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s)
             """, (
                 bundle_id,
                 bundle_id,
                 item["product_id"],
                 item["quantity"],
-                selling_price
+                selling_price,
+                total_buying_price  # Store the total cost
             ))
+            print(f"  ✅ Inserted item {item['product_id']} with bundle_buying_price: {total_buying_price}")
 
         conn.commit()
+        print(f"✅ Bundle {bundle_id} created with cost: {total_buying_price}")
 
         return jsonify({
             "message": "Bundle created successfully",
-            "bundle_id": bundle_id
+            "bundle_id": bundle_id,
+            "buying_price": total_buying_price
         }), 201
 
     except Exception as e:
-        print("Error adding bundle:", e)
+        print("❌ Error adding bundle:", e)
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": "Internal server error"}), 500
 
     finally:
@@ -886,13 +934,25 @@ def update_bundle(bundle_id):
         if not cursor.fetchone():
             return jsonify({"error": "Bundle not found"}), 404
 
+        # Calculate new total buying price
+        total_buying_price = 0
+        for item in bundle_items:
+            cursor.execute(
+                "SELECT buying_price FROM products WHERE product_id = %s",
+                (item["product_id"],)
+            )
+            product = cursor.fetchone()
+            if product:
+                item_buying_price = (product["buying_price"] or 0) * item["quantity"]
+                total_buying_price += item_buying_price
+
         # 🔥 Remove existing bundle items
         cursor.execute(
             "DELETE FROM product_bundles WHERE bundle_id = %s",
             (bundle_id,)
         )
 
-        # ♻️ Re-insert updated bundle items
+        # ♻️ Re-insert updated bundle items with new buying price
         for item in bundle_items:
             cursor.execute("""
                 INSERT INTO product_bundles (
@@ -900,21 +960,24 @@ def update_bundle(bundle_id):
                     parent_product_id,
                     child_product_id,
                     quantity,
-                    selling_price
+                    selling_price,
+                    bundle_buying_price
                 )
-                VALUES (%s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s)
             """, (
                 bundle_id,
                 bundle_id,
                 item["product_id"],
                 item["quantity"],
-                selling_price
+                selling_price,
+                total_buying_price  # Store updated total
             ))
 
         conn.commit()
 
         return jsonify({
-            "message": "Bundle updated successfully"
+            "message": "Bundle updated successfully",
+            "buying_price": total_buying_price
         }), 200
 
     except Exception as e:
@@ -1883,12 +1946,15 @@ def add_supplier_product(supplier_id):
 
         product_id = int(data["product_id"])
         stock_supplied = int(data["stock_supplied"])
-        price = float(data["price"])
+        price = float(data["price"])  # This is the total price for the whole batch
         supply_date = data["supply_date"]
 
         conn = get_db_connection()
         cursor = conn.cursor()
         conn.start_transaction()
+
+        # ✅ Calculate price per unit
+        price_per_unit = price / stock_supplied
 
         # ✅ 1. Check if materials are enough before inserting anything
         cursor.execute(
@@ -1924,7 +1990,30 @@ def add_supplier_product(supplier_id):
                         "error": f"❌ Insufficient {material_name}. Short by {remaining} units"
                     }), 400
 
-        # ✅ 2. Proceed to insert and update since materials are enough
+        # ✅ 2. Get current product data for weighted average calculation
+        cursor.execute(
+            "SELECT product_stock, buying_price FROM products WHERE product_id = %s FOR UPDATE",
+            (product_id,)
+        )
+        current_product = cursor.fetchone()
+        current_stock = current_product[0] if current_product else 0
+        current_buying_price = current_product[1] if current_product else 0
+
+        # ✅ 3. Calculate new weighted average buying price
+        if current_stock > 0:
+            # Weighted average formula: (old_stock * old_price + new_stock * new_price) / total_stock
+            total_value = (current_stock * current_buying_price) + (stock_supplied * price_per_unit)
+            total_stock = current_stock + stock_supplied
+            new_buying_price = total_value / total_stock
+        else:
+            # If no existing stock, use the price per unit as the buying price
+            new_buying_price = price_per_unit
+
+        print(f"💰 Current stock: {current_stock}, Current buying price: {current_buying_price}")
+        print(f"💰 New stock: {stock_supplied}, Price per unit: {price_per_unit}")
+        print(f"💰 New weighted average buying price: {new_buying_price}")
+
+        # ✅ 4. Proceed to insert and update since materials are enough
         cursor.execute(
             """INSERT INTO supplier_products 
             (supplier_id, product_id, stock_supplied, price, supply_date)
@@ -1932,14 +2021,16 @@ def add_supplier_product(supplier_id):
             (supplier_id, product_id, stock_supplied, price, supply_date)
         )
 
+        # ✅ 5. Update product stock AND buying_price with the new weighted average
         cursor.execute(
             """UPDATE products 
-            SET product_stock = product_stock + %s
+            SET product_stock = product_stock + %s,
+                buying_price = %s
             WHERE product_id = %s""",
-            (stock_supplied, product_id)
+            (stock_supplied, new_buying_price, product_id)
         )
 
-        # ✅ 3. Deduct materials now
+        # ✅ 6. Deduct materials now
         for material_id, material_qty_per_unit in recipes:
             total_needed = material_qty_per_unit * stock_supplied
             remaining = total_needed
@@ -1964,9 +2055,11 @@ def add_supplier_product(supplier_id):
 
         conn.commit()
         return jsonify({
-            "message": "✅ Supply added and materials deducted successfully",
+            "message": "✅ Supply added, materials deducted, and buying price updated successfully",
             "product_id": product_id,
-            "stock_added": stock_supplied
+            "stock_added": stock_supplied,
+            "price_per_unit": round(price_per_unit, 2),
+            "new_buying_price": round(new_buying_price, 2)
         }), 201
 
     except ValueError as ve:
@@ -1975,6 +2068,8 @@ def add_supplier_product(supplier_id):
         return jsonify({"error": f"Invalid data: {ve}"}), 400
     except Exception as e:
         print("Error:", e)
+        import traceback
+        traceback.print_exc()
         if 'conn' in locals():
             conn.rollback()
         return jsonify({"error": "Internal Server Error"}), 500
@@ -2334,7 +2429,7 @@ def process_sale():
         # Generate order number
         order_number = generate_order_number(cursor)
 
-        # Insert sale
+        # Insert sale (discount is stored here)
         cursor.execute("""
             INSERT INTO sales (customer_id, total_price, payment_type, vat, discount, status, order_number)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -2349,18 +2444,38 @@ def process_sale():
         ))
         sale_id = cursor.lastrowid
 
+        # Calculate discount ratio for proportional distribution
+        discount_ratio = discount / total_amount if total_amount > 0 else 0
+
         # Process cart items
         for item in cart_items:
             product_id = item["product_id"]
-            # CHANGE THIS: Use float instead of int for quantity
-            quantity = float(item["quantity"])  # Changed from int(item["quantity"])
+            # Use float for quantity
+            quantity = float(item["quantity"])
             subtotal = float(item["subtotal"])
+            
+            # Calculate item's share of discount (for profit calculation only)
+            item_discount = subtotal * discount_ratio
 
             # -------------------------------
             # Bundle products
             # -------------------------------
             if isinstance(product_id, str) and product_id.startswith("bundle-"):
                 bundle_id = int(product_id.replace("bundle-", ""))
+
+                # Get bundle buying price for profit calculation
+                cursor.execute("""
+                    SELECT bundle_buying_price 
+                    FROM product_bundles 
+                    WHERE bundle_id = %s 
+                    LIMIT 1
+                """, (bundle_id,))
+                bundle_result = cursor.fetchone()
+                bundle_buying_price = float(bundle_result[0]) if bundle_result else 0
+                
+                # Calculate cost and profit with discount
+                cost = quantity * bundle_buying_price
+                profit = subtotal - cost - item_discount  # Discount deducted from profit
 
                 # Lock child products
                 cursor.execute("""
@@ -2379,9 +2494,9 @@ def process_sale():
                     conn.rollback()
                     return jsonify({"error": "Invalid bundle"}), 400
 
-                # Check bundle stock - CHANGE THIS to handle decimal quantities
+                # Check bundle stock
                 max_bundles = min(
-                    float(item_stock) / float(child_qty)  # Changed to float division
+                    float(item_stock) / float(child_qty)
                     for (_, child_qty, item_stock) in bundle_items
                 )
                 if max_bundles < quantity:
@@ -2390,33 +2505,34 @@ def process_sale():
                         "error": "Insufficient stock for bundle"
                     }), 400
 
-                # Insert sale item for bundle
+                # Insert sale item for bundle with profit (REMOVED discount column)
                 cursor.execute("""
-                    INSERT INTO sales_items (sale_id, product_id, bundle_id, quantity, subtotal)
-                    VALUES (%s, %s, %s, %s, %s)
-                """, (sale_id, None, bundle_id, quantity, subtotal))
+                    INSERT INTO sales_items (sale_id, product_id, bundle_id, quantity, subtotal, buying_price, profit)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (sale_id, None, bundle_id, quantity, subtotal, bundle_buying_price, profit))
 
-                # Deduct child stock - CHANGE THIS to handle decimal quantities
+                # Deduct child stock
                 for child_id, child_qty, _ in bundle_items:
                     cursor.execute("""
                         UPDATE products
                         SET product_stock = product_stock - %s
                         WHERE product_id = %s
-                    """, (float(child_qty) * quantity, child_id))  # Changed to float multiplication
+                    """, (float(child_qty) * quantity, child_id))
 
             # -------------------------------
             # Normal products
             # -------------------------------
             else:
+                # Get product buying price for profit calculation
                 cursor.execute("""
-                    SELECT product_stock
+                    SELECT product_stock, buying_price
                     FROM products
                     WHERE product_id = %s
                     FOR UPDATE
                 """, (product_id,))
                 product = cursor.fetchone()
 
-                if not product or float(product[0]) < quantity:  # Changed to float comparison
+                if not product or float(product[0]) < quantity:
                     conn.rollback()
                     return jsonify({
                         "error": "INSUFFICIENT_STOCK",
@@ -2426,18 +2542,24 @@ def process_sale():
                         "available": product[0] if product else 0
                     }), 400
 
-                # Insert sale item
-                cursor.execute("""
-                    INSERT INTO sales_items (sale_id, product_id, bundle_id, quantity, subtotal)
-                    VALUES (%s, %s, %s, %s, %s)
-                """, (sale_id, product_id, None, quantity, subtotal))
+                buying_price = float(product[1]) if product[1] else 0
+                
+                # Calculate cost and profit with discount
+                cost = quantity * buying_price
+                profit = subtotal - cost - item_discount  # Discount deducted from profit
 
-                # Deduct stock - CHANGE THIS to handle decimal deduction
+                # Insert sale item with profit (REMOVED discount column)
+                cursor.execute("""
+                    INSERT INTO sales_items (sale_id, product_id, bundle_id, quantity, subtotal, buying_price, profit)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (sale_id, product_id, None, quantity, subtotal, buying_price, profit))
+
+                # Deduct stock
                 cursor.execute("""
                     UPDATE products
                     SET product_stock = product_stock - %s
                     WHERE product_id = %s
-                """, (quantity, product_id))  # quantity is now float
+                """, (quantity, product_id))
 
         # Commit transaction
         conn.commit()
@@ -2450,6 +2572,8 @@ def process_sale():
     except Exception as e:
         conn.rollback()
         print("❌ ERROR in process_sale:", str(e))
+        import traceback
+        traceback.print_exc()
         return jsonify({"error": "Internal server error"}), 500
 
     finally:
@@ -2703,7 +2827,7 @@ def get_orders():
         start_date = request.args.get("start_date")
         end_date = request.args.get("end_date")
 
-        # SQL query with CALCULATED buying price (same logic as /get-products)
+        # SQL query using stored values from sales_items
         query = """
             SELECT 
                 s.sale_id,
@@ -2720,40 +2844,30 @@ def get_orders():
                 si.product_id,
                 si.bundle_id,
                 si.quantity,
+                si.subtotal,
+                si.buying_price,
+                si.profit,  -- Use stored profit from sales_items
+                -- si.discount as item_discount,  -- REMOVED - column doesn't exist
 
+                -- Product details
                 p.product_name AS product_name,
                 p.product_price AS product_price,
 
-                COALESCE(
-                    ROUND(
-                        SUM(sp.price) / NULLIF(SUM(sp.stock_supplied), 0),
-                        2
-                    ),
-                    0
-                ) AS buying_price,
-
+                -- Bundle details
                 pb.selling_price AS bundle_selling_price,
+                pb.bundle_buying_price AS bundle_buying_price,  -- Use stored bundle buying price
+
+                -- Child product details for bundle items (for display only)
                 pb.child_product_id,
                 pb.quantity AS bundle_quantity,
-
-                cp.product_name AS child_product_name,
-
-                COALESCE(
-                    ROUND(
-                        SUM(csp.price) / NULLIF(SUM(csp.stock_supplied), 0),
-                        2
-                    ),
-                    0
-                ) AS child_product_buying_price
+                cp.product_name AS child_product_name
 
             FROM sales s
             LEFT JOIN customers c ON s.customer_id = c.customer_id
             LEFT JOIN sales_items si ON s.sale_id = si.sale_id
             LEFT JOIN products p ON si.product_id = p.product_id
-            LEFT JOIN supplier_products sp ON p.product_id = sp.product_id
             LEFT JOIN product_bundles pb ON si.bundle_id = pb.bundle_id
             LEFT JOIN products cp ON pb.child_product_id = cp.product_id
-            LEFT JOIN supplier_products csp ON cp.product_id = csp.product_id
         """
 
         cursor = conn.cursor(dictionary=True)
@@ -2761,12 +2875,7 @@ def get_orders():
         if start_date and end_date:
             query += """
                 WHERE s.sale_date BETWEEN %s AND %s
-                GROUP BY 
-                    s.sale_id,
-                    si.sale_item_id,
-                    p.product_id,
-                    pb.bundle_id,
-                    cp.product_id
+                ORDER BY s.sale_date DESC
             """
             cursor.execute(
                 query,
@@ -2774,12 +2883,6 @@ def get_orders():
             )
         else:
             query += """
-                GROUP BY 
-                    s.sale_id,
-                    si.sale_item_id,
-                    p.product_id,
-                    pb.bundle_id,
-                    cp.product_id
                 ORDER BY s.sale_date DESC
             """
             cursor.execute(query)
@@ -2797,61 +2900,47 @@ def get_orders():
                     "order_number": order["order_number"],
                     "customer_id": order["customer_id"],
                     "customer_name": order["customer_name"],
-                    "total_price": order["total_price"],
+                    "total_price": float(order["total_price"]),
                     "payment_type": order["payment_type"],
                     "sale_date": order["sale_date"]
                         .astimezone(pytz.timezone("Africa/Nairobi"))
                         .isoformat(),
-                    "vat": order["vat"],
-                    "discount": order["discount"],
+                    "vat": float(order["vat"] or 0),
+                    "discount": float(order["discount"] or 0),
                     "status": order["status"],
                     "items": [],
-                    "gross_profit": 0.0,
-                    "profit": 0.0
+                    "profit": 0.0  # Will sum from items
                 }
 
             quantity_sold = float(order["quantity"] or 0)
             is_bundle = order["bundle_id"] is not None
 
+            # Get selling price
             selling_price = float(
                 order["bundle_selling_price"]
                 if is_bundle
                 else order["product_price"] or 0
             )
 
-            buying_price = (
-                float(order["buying_price"] or 0)
-                if not is_bundle
-                else None
-            )
+            # Get buying price (stored at time of sale)
+            buying_price = float(order["buying_price"] or 0)
 
-            subtotal = float(selling_price) * float(quantity_sold)
+            # Get item profit (stored at time of sale)
+            item_profit = float(order["profit"] or 0)
 
-            # Profit calculation
-            item_profit = 0.0
+            # Get item subtotal
+            subtotal = float(order["subtotal"] or 0)
 
+            # Determine display name
             if is_bundle:
-                child_buying = float(order["child_product_buying_price"] or 0)
-                bundle_qty = float(order["bundle_quantity"] or 0)
+                display_name = f"Bundle #{order['bundle_id']}"
+                # Try to get child product names for better display
+                if order["child_product_name"]:
+                    display_name = f"Bundle ({order['child_product_name']} + more)"
+            else:
+                display_name = order["product_name"] or "Unknown Product"
 
-                item_profit = (
-                    selling_price - (child_buying * bundle_qty)
-                ) * quantity_sold
-
-            elif buying_price is not None:
-                item_profit = (selling_price - buying_price) * quantity_sold
-
-            grouped_orders[sale_id]["gross_profit"] += item_profit
-
-            display_name = (
-                order["child_product_name"]
-                if is_bundle
-                else order["product_name"]
-            )
-
-            if is_bundle:
-                display_name += " (Bundle)"
-
+            # Add item to order
             grouped_orders[sale_id]["items"].append({
                 "product_id": order["product_id"],
                 "bundle_id": order["bundle_id"],
@@ -2861,15 +2950,14 @@ def get_orders():
                 "quantity": quantity_sold,
                 "subtotal": subtotal,
                 "is_bundle": is_bundle,
-                "profit": round(item_profit, 2)
+                "profit": round(item_profit, 2),
+                # "discount": float(order["item_discount"] or 0)  -- REMOVED this line
             })
 
-        # Finalize profit
+        # Calculate total profit for each order by summing item profits
         for order in grouped_orders.values():
-            discount = float(order["discount"] or 0)
-            gross = order["gross_profit"]
-            order["profit"] = round(gross - discount, 2)
-            del order["gross_profit"]
+            total_profit = sum(item["profit"] for item in order["items"])
+            order["profit"] = round(total_profit, 2)
 
         response = jsonify({"orders": list(grouped_orders.values())})
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
@@ -2878,12 +2966,17 @@ def get_orders():
 
         return response
 
+    except Exception as e:
+        print(f"❌ Error in get_orders: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
     finally:
         if "cursor" in locals():
             cursor.close()
         if conn:
             conn.close()
-
 
 @app.route("/update-order-status", methods=["POST"])
 def update_order_status():
